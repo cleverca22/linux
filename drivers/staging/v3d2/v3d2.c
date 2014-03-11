@@ -19,6 +19,7 @@
 static dev_t characterDevice;
 struct cdev *v3d2_cdev = 0;
 enum JobState { idle, notEnabled, compiling, waiting, running, finished };
+const char *states[] = { "idle","not enabled","compiling","waiting","running","finished"};
 struct v3d2Handle {
 	spinlock_t lock;
 	struct MemoryReference **references;
@@ -66,9 +67,14 @@ static irqreturn_t irq_handler(int i, void *blah, struct pt_regs *regs) {
 		if (mainHandle->rs == waiting) {
 			uint32_t rawrenderer = virt_to_phys(mainHandle->activeRenderer);
 			mainHandle->rs = running;
-			printk(KERN_ERR"starting renderer thread\n");
+			printk(KERN_ERR"starting renderer thread %p + %d\n",rawrenderer,mainHandle->activeJob->renderer.size);
+			v3dio[V3D_CT1CS] = 8000;
+			v3dio[V3D_L2CACTL] = 0x03;;
+			wmb();
 			v3dio[V3D_CT1CA] = rawrenderer;
+			wmb();
 			v3dio[V3D_CT1EA] = rawrenderer + mainHandle->activeJob->renderer.size;
+			wmb();
 		}
 	}
 	// FIXME, if these finish abnormally, they wont free
@@ -313,8 +319,10 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			//	printk("0x%02x ",temp[i]);
 			//}
 			//printk("\n");
-			printk(KERN_ERR"starting binner on thread 0, old CS:%x, INTENA:%x\n",v3dio[V3D_CT0CS],v3dio[V3D_INTENA]);
+			printk(KERN_ERR"starting binner on thread 0, old CS:%x\n",v3dio[V3D_CT0CS]);
 			handle->bs = running;
+			v3dio[V3D_CT0CS] = 8000;
+			v3dio[V3D_L2CACTL] = 0x03;;
 			v3dio[V3D_CT0CA] = virt_to_phys(handle->activeBinner);
 			v3dio[V3D_CT0EA] = virt_to_phys(handle->activeBinner) + handle->activeJob->binner.size;
 			status = v3dio[V3D_CT0CS];
@@ -337,10 +345,11 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			spin_lock_irqsave(&handle->lock,flags);
 			if (handle->bs == finished) {
 				// binner finished while linking
+				uint32_t rawrenderer = virt_to_phys(mainHandle->activeRenderer);
+				printk(KERN_ERR"starting renderer thread from ioctl %p + %d\n",rawrenderer,mainHandle->activeJob->renderer.size);
 				mainHandle->rs = running;
-				printk(KERN_ERR"starting renderer thread from ioctl\n");
-				v3dio[V3D_CT1CA] = virt_to_phys(handle->activeRenderer);
-				v3dio[V3D_CT1EA] = virt_to_phys(handle->activeRenderer) + mainHandle->activeJob->renderer.size;
+				v3dio[V3D_CT1CA] = rawrenderer;
+				v3dio[V3D_CT1EA] = rawrenderer + mainHandle->activeJob->renderer.size;
 			} else {
 				handle->rs = waiting;
 				printk(KERN_ERR"queued renderer\n");
@@ -405,7 +414,7 @@ ssize_t v3d2_read(struct file *filp,char __user *buffer, size_t size, loff_t *f_
 	unsigned long flags;
 	spin_lock_irqsave(&handle->lock,flags);
 	if (handle->rs == idle) return -EWOULDBLOCK;
-	printk(KERN_ERR"b/r state %d %d, INTENA:%x\n",handle->bs,handle->rs,v3dio[V3D_INTENA]);
+	printk(KERN_ERR"b/r state %s %s\n",states[handle->bs],states[handle->rs]);
 	spin_unlock_irqrestore(&handle->lock,flags);
 	
 	if (wait_event_interruptible(handle->queue,handle->rs == finished)) return -ERESTARTSYS;
