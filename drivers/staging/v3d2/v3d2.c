@@ -16,10 +16,10 @@
 #include "v3d2_ioctl.h"
 #include "v3d.h"
 
-static dev_t characterDevice;
-struct cdev *v3d2_cdev = 0;
+static int qpu_enable(unsigned int enable);
+
 enum JobState { idle, notEnabled, compiling, waiting, running, finished };
-const char *states[] = { "idle","not enabled","compiling","waiting","running","finished"};
+
 struct v3d2Handle {
 	spinlock_t lock;
 	struct MemoryReference **references;
@@ -33,10 +33,15 @@ struct v3d2Handle {
 	wait_queue_head_t queue;
 	JobStatusPacket status;
 	void *activeBinner;
+	int binnerSize;
 	void *activeRenderer;
+	int rendererSize;
 };
 struct v3d2Handle *mainHandle = 0;
 volatile unsigned *v3dio = 0;
+const char *states[] = { "idle","not enabled","compiling","waiting","running","finished"};
+struct cdev *v3d2_cdev = 0;
+static dev_t characterDevice;
 
 // 05 23:30:41 < ssvb> basically you just use 'dma_alloc_coherent' function and it works for large memory blocks
 // you need to boot with cma=64M if you want to be able to allocate large blocks
@@ -44,7 +49,6 @@ volatile unsigned *v3dio = 0;
 
 volatile int count = 0;
 
-static int qpu_enable(unsigned int enable);
 
 static irqreturn_t irq_handler(int i, void *blah, struct pt_regs *regs) {
 	int status;
@@ -55,8 +59,12 @@ static irqreturn_t irq_handler(int i, void *blah, struct pt_regs *regs) {
 		count++;
 	}
 	count++;
+	if (!v3dio) {
+		printk(KERN_ERR"v3dio isnt mapped!!!\n");
+		return IRQ_HANDLED;
+	}
 	status = v3dio[V3D_INTCTL];
-	printk(KERN_ERR" interupt! status %x %x %x\n",status,v3dio[V3D_CT0CS],v3dio[V3D_CT1CS]);
+	printk(KERN_ERR"interupt! status %x %x %x\n",status,v3dio[V3D_CT0CS],v3dio[V3D_CT1CS]);
 	v3dio[V3D_INTCTL] = 0x7;
 	if (!mainHandle) {
 		printk(KERN_ERR"interupt while device not in use\n");
@@ -67,13 +75,13 @@ static irqreturn_t irq_handler(int i, void *blah, struct pt_regs *regs) {
 		if (mainHandle->rs == waiting) {
 			uint32_t rawrenderer = virt_to_phys(mainHandle->activeRenderer);
 			mainHandle->rs = running;
-			printk(KERN_ERR"starting renderer thread %p + %d\n",rawrenderer,mainHandle->activeJob->renderer.size);
+			printk(KERN_ERR"starting renderer thread %p + %d\n",rawrenderer,mainHandle->rendererSize);
 			v3dio[V3D_CT1CS] = 8000;
 			v3dio[V3D_L2CACTL] = 0x03;;
 			wmb();
 			v3dio[V3D_CT1CA] = rawrenderer;
 			wmb();
-			v3dio[V3D_CT1EA] = rawrenderer + mainHandle->activeJob->renderer.size;
+			v3dio[V3D_CT1EA] = rawrenderer + mainHandle->rendererSize;
 			wmb();
 		}
 	}
@@ -99,6 +107,7 @@ static int v3d2_open(struct inode *inode, struct file *filp) {
 	
 	if (mainHandle) return -EBUSY;
 	handle = kmalloc(sizeof(struct v3d2Handle),GFP_KERNEL);
+	memset(handle,0,sizeof(struct v3d2Handle));
 	init_waitqueue_head(&handle->queue);
 	spin_lock_init(&handle->lock);
 	handle->rs = idle;
@@ -121,11 +130,6 @@ static int v3d2_open(struct inode *inode, struct file *filp) {
 	}
 	for (i=0; i<handle->maxrefs; i++) handle->references[i] = 0;
 
-	result = request_irq(INTERRUPT_3D,(irq_handler_t) irq_handler,0,"v3d2",(void*)0);
-	if (result) {
-		printk(KERN_ERR" error %d getting interupt\n",result);
-		handle->gotirq = false;
-	} else {
 		v3dio = ioremap_nocache(BCM2708_PERI_BASE + 0xc00000,0x1000);
 		if (v3dio[V3D_IDENT0] == 0x02443356) {
 			printk(KERN_ERR"v3d core already online\n");
@@ -135,37 +139,40 @@ static int v3d2_open(struct inode *inode, struct file *filp) {
 				printk(KERN_ERR"cant find magic number in v3d registers\n");
 			}
 		}
-		handle->gotirq = true;
 		if (!v3dio) {
-			free_irq(INTERRUPT_3D,(void*)0);
 			kfree(handle->references);
 			release_mem_region(BCM2708_PERI_BASE + 0xc00000 + V3D_INTENA,0x1000);
 			kfree(handle);
 			return -EBUSY;
 		}
-		//outb(0x2,v3dio + V3D_INTENA);
+	result = request_irq(INTERRUPT_3D,(irq_handler_t) irq_handler,0,"v3d2",(void*)0);
+	if (result) {
+		printk(KERN_ERR" error %d getting interupt\n",result);
+		handle->gotirq = false;
+	} else {
+		handle->gotirq = true;
 		v3dio[V3D_INTENA]= 0x03;
 		printk(KERN_ERR"INTENA:%x\n",v3dio[V3D_INTENA]);
 	}
 	return 0;
 }
-void FreeCMA(struct MemoryReference *ref) {
-	dma_free_coherent(NULL,ref->size,ref->virt,ref->physical);
-	kfree(ref);
-}
 void CheckAndFree(struct MemoryReference *ref) {
 	if (ref->mmap_count) return;
-	FreeCMA(ref);
+	dma_free_coherent(NULL,ref->size,ref->virt,ref->physical);
+	kfree(ref);
 	printk(KERN_ERR"released ram\n");
 }
 static int v3d2_release(struct inode *inode, struct file *filp) {
 	int i;
 	struct v3d2Handle *handle = filp->private_data;
-	// FIXME, shut the qpu core down
-	//
-	//outb(0x0,v3dio + V3D_INTENA);
 	v3dio[V3D_INTENA] = 0x00;
 	if (handle->gotirq) free_irq(INTERRUPT_3D,(void*)0);
+	qpu_enable(0);
+	if (v3dio[V3D_IDENT0] == 0x02443356) {
+		printk(KERN_ERR"qpu still online\n");
+	} else {
+		printk(KERN_ERR"qpu shut off\n");
+	}
 	iounmap(v3dio);
 	release_mem_region(BCM2708_PERI_BASE + 0xc00000,0x1000);
 	for (i=0; i<handle->maxrefs; i++) {
@@ -177,8 +184,8 @@ static int v3d2_release(struct inode *inode, struct file *filp) {
 	mainHandle = NULL;
 	kfree(handle->references);
 	kfree(handle);
+	
 	printk(KERN_ERR"FD released PID:%d\n",current->pid);
-	// FIXME, release all memory allocated via mailbox
 	return 0;
 }
 int AllocateCMA(struct v3d2Handle *handle, unsigned int size,struct MemoryReference **refout, V3dMemoryHandle *out) {
@@ -198,7 +205,7 @@ int AllocateCMA(struct v3d2Handle *handle, unsigned int size,struct MemoryRefere
 	}
 	ref->mmap_count = 1;
 	*refout = ref;
-	printk(KERN_ERR"allocated %dMB at phys:%x virt:%p\n",size/1024/1024,ref->physical,ref->virt);
+	printk(KERN_ERR"allocated %dKB at phys:%x virt:%p\n",size/1024,ref->physical,ref->virt);
 	
 	handle->references[i] = ref;
 	*out = i;
@@ -219,6 +226,59 @@ static int qpu_enable(unsigned int enable) {
 	bcm_mailbox_property(message,i*sizeof(unsigned int));
 
 	ret = message[5];
+
+	return ret;
+}
+static int mem_lock(unsigned int handle) {
+	int i = 1,ret;
+	unsigned int message[32];
+	message[i++] = 0; // request
+	message[i++] = 0x3000d; // Lock memory
+	message[i++] = 4; // size of buffer
+	message[i++] = 4; // size of data
+	message[i++] = handle;
+	message[i++] = 0; // end tag
+	message[0] = i * sizeof(unsigned int);
+
+	bcm_mailbox_property(message,i*sizeof(unsigned int));
+	
+	ret = message[5];
+
+	return ret;
+}
+static int mem_unlock(unsigned int handle) {
+	int i = 1,ret;
+	unsigned int message[32];
+	message[i++] = 0; // request
+	message[i++] = 0x3000e; // Unlock memory
+	message[i++] = 4; // size of buffer
+	message[i++] = 4; // size of data
+	message[i++] = handle;
+	message[i++] = 0; // end tag
+	message[0] = i * sizeof(unsigned int);
+
+	bcm_mailbox_property(message,i*sizeof(unsigned int));
+
+	ret = message[5];
+
+	return ret;
+}
+static int get_dispmanx_mem_handle(DISPMANX_RESOURCE_HANDLE_T resource) {
+	int i = 1,ret;
+	unsigned int message[32];
+	message[i++] = 0; // request
+	message[i++] = 0x30014; // Get Dispmanx Resource mem handle
+	message[i++] = 8; // size of buffer
+	message[i++] = 4; // size of data
+	message[i++] = resource;
+	message[i++] = 0; // filler
+	message[i++] = 0; // end tag
+	message[0] = i * sizeof(unsigned int);
+
+
+	bcm_mailbox_property(message,i*sizeof(unsigned int));
+
+	ret = message[6];
 
 	return ret;
 }
@@ -293,6 +353,11 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 		break;
 	case V3D2_COMPILE_CL:
 		count = 0; // FIXME, remove this later?
+		if (handle->activeJob) {
+			printk(KERN_ERR"a job is already active\n");
+			ret = -EBUSY;
+			break;
+		}
 		handle->activeJob = kmalloc(sizeof(JobCompileRequest),GFP_KERNEL);
 		if (copy_from_user(handle->activeJob,(const void __user *)arg,sizeof(JobCompileRequest)) != 0) {
 			ret = -EFAULT;
@@ -302,44 +367,45 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			printk(KERN_ERR"binner in use\n");
 			ret = -EBUSY;
 			break;
+			// FIXME, memleak
+		}
+		if (handle->activeJob->outputType == opDispmanx) {
+			// FIXME, find control tag 133, insert the raw addr, and unlock once frame is rendered
+			int dispmanhandle = get_dispmanx_mem_handle(handle->activeJob->output.resource);
+			uint32_t dispmanraw = mem_lock(dispmanhandle);
+			printk(KERN_ERR"dispmanx buffer at %d %x\n",dispmanhandle,dispmanraw);
+			mem_unlock(dispmanhandle);
 		}
 		handle->activeBinner = kmalloc(handle->activeJob->binner.size,GFP_KERNEL);
+		handle->binnerSize = handle->activeJob->binner.size;
 		ret = compileJob(handle,&handle->activeJob->binner,handle->activeBinner);
 		handle->status.binnerFinished = 0;
 		handle->status.rendererFinished = 0;
 		handle->status.jobid = handle->activeJob->jobid;
+			// FIXME, memleak
 		if (ret) break;
 		if (handle->activeJob->renderer.run == 0) handle->rs = notEnabled;
 		else handle->rs = compiling;
 		if (handle->activeJob->binner.run) {
 			int status;
-			//uint8_t *temp = binner->virt;
-			//printk(KERN_ERR"binner %p == ",temp);
-			//for (i=0; i<handle->activeJob->binner.size; i++) {
-			//	printk("0x%02x ",temp[i]);
-			//}
-			//printk("\n");
-			printk(KERN_ERR"starting binner on thread 0, old CS:%x\n",v3dio[V3D_CT0CS]);
+			uint32_t rawbinner = virt_to_phys(handle->activeBinner);
+			printk(KERN_ERR"starting binner on thread 0, old CS:%x, new CS:%x\n",v3dio[V3D_CT0CS],rawbinner);
 			handle->bs = running;
 			v3dio[V3D_CT0CS] = 8000;
 			v3dio[V3D_L2CACTL] = 0x03;;
-			v3dio[V3D_CT0CA] = virt_to_phys(handle->activeBinner);
-			v3dio[V3D_CT0EA] = virt_to_phys(handle->activeBinner) + handle->activeJob->binner.size;
+			wmb();
+			__asm volatile ("mcrr p15, #0, %[end], %[start], c12" : : [end] "r" (handle->activeBinner+handle->binnerSize), [start] "r" (handle->activeBinner) );
+			v3dio[V3D_CT0CA] = rawbinner;
+			wmb();
+			v3dio[V3D_CT0EA] = rawbinner + handle->activeJob->binner.size;
 			status = v3dio[V3D_CT0CS];
 			if (status != 0x20) printk(KERN_ERR"binner started, status %x\n",status);
 		}
 		handle->activeRenderer = kmalloc(handle->activeJob->renderer.size,GFP_KERNEL);
 		ret = compileJob(handle,&handle->activeJob->renderer,handle->activeRenderer);
+			// FIXME, memleak
 		if (ret) break;
 		if (handle->activeJob->renderer.run) {
-			//struct MemoryReference *renderer = handle->references[handle->activeJob->renderer.handle];
-			//int i;
-			//uint8_t *temp = renderer->virt;
-			//printk(KERN_ERR"render %p == ",temp);
-			//for (i=0; i<handle->activeJob->renderer.size; i++) {
-			//	printk("0x%02x ",temp[i]);
-			//}
-			//printk("\n");
 			unsigned long flags;
 			// since this disables interupts, and the bcm2708 only has 1 arm core, the interupt doesnt have to lock it
 			spin_lock_irqsave(&handle->lock,flags);
@@ -353,13 +419,17 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			} else {
 				handle->rs = waiting;
 				printk(KERN_ERR"queued renderer\n");
+				handle->rendererSize = mainHandle->activeJob->renderer.size;
 			}
 			spin_unlock_irqrestore(&handle->lock,flags);
 		}
 		if (copy_to_user((void __user *)arg,handle->activeJob,sizeof(JobCompileRequest)) != 0) {
 			ret = -EFAULT;
+			// FIXME, memleak
 			break;
 		}
+		kfree(mainHandle->activeJob);
+		mainHandle->activeJob = 0;
 		break;
 	default:
 		ret = -EINVAL;
@@ -370,12 +440,12 @@ static long v3d2_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 void v3d2_vma_open(struct vm_area_struct *vma) {
 	struct MemoryReference *ref = vma->vm_private_data;
 	ref->mmap_count++;
-	printk(KERN_NOTICE "V3D2 VMA open, virt %lx, phys %lx\n\n",vma->vm_start, vma->vm_pgoff << PAGE_SHIFT);
+	//printk(KERN_NOTICE "V3D2 VMA open, virt %lx, phys %lx\n\n",vma->vm_start, vma->vm_pgoff << PAGE_SHIFT);
 }
 void v3d2_vma_close(struct vm_area_struct *vma) {
 	struct MemoryReference *ref = vma->vm_private_data;
 	ref->mmap_count--;
-	printk(KERN_NOTICE "V3D2 VMA close.\n");
+	//printk(KERN_NOTICE "V3D2 VMA close.\n");
 	CheckAndFree(ref);
 }
 static struct vm_operations_struct v3d2_remap_vm_ops = {
@@ -410,16 +480,44 @@ int v3d2_mmap(struct file *filp, struct vm_area_struct *vma) {
 ssize_t v3d2_read(struct file *filp,char __user *buffer, size_t size, loff_t *f_pos) {
 	int ret,bytesToCopy;
 	struct v3d2Handle *handle = filp->private_data;
-
+	int boffset = 0;
+	int roffset = 0;
 	unsigned long flags;
+	int i;
+
 	spin_lock_irqsave(&handle->lock,flags);
-	if (handle->rs == idle) return -EWOULDBLOCK;
-	printk(KERN_ERR"b/r state %s %s\n",states[handle->bs],states[handle->rs]);
+	if (handle->rs == idle) {
+		spin_unlock_irqrestore(&handle->lock,flags);
+		return -EWOULDBLOCK;
+	}
+	printk(KERN_ERR" pre b/r state %s %s\n",states[handle->bs],states[handle->rs]);
+	if (handle->bs == running) {
+		printk(KERN_ERR"binner CS:%x\n",v3dio[V3D_CT0CS]);
+	}
 	spin_unlock_irqrestore(&handle->lock,flags);
 	
-	if (wait_event_interruptible(handle->queue,handle->rs == finished)) return -ERESTARTSYS;
+	if (wait_event_interruptible_timeout(handle->queue,handle->rs == finished,HZ*10)) return -ERESTARTSYS;
+	printk(KERN_ERR"post b/r state %s %s\n",states[handle->bs],states[handle->rs]);
 	handle->rs = idle;
 	printk(KERN_ERR"woke up\n");
+	
+	if (handle->activeBinner) boffset = virt_to_phys(handle->activeBinner);
+	if (handle->activeRenderer) roffset = virt_to_phys(handle->activeRenderer);
+	
+	printk(KERN_ERR" CS CA EA\n");
+	printk(KERN_ERR"%2x %4x %4x\n",v3dio[V3D_CT0CS],v3dio[V3D_CT0CA] - boffset,v3dio[V3D_CT0EA]-boffset);
+	printk(KERN_ERR"%2x %4x %4x\n",v3dio[V3D_CT1CS],v3dio[V3D_CT1CA] - roffset,v3dio[V3D_CT1EA]-roffset);
+	if (handle->bs == running) {
+		uint8_t *temp = handle->activeBinner;
+		int pointer = v3dio[V3D_CT0CA] - boffset;
+		printk(KERN_ERR" binner virt addr %x == ");
+		for (i=0; i<handle->binnerSize; i++) {
+			if (pointer == i) printk("[%03d] ",temp[i]);
+			else printk("%03d ",temp[i]);
+		}
+		printk("\n");
+	}
+	
 	if (size > sizeof(JobStatusPacket)) bytesToCopy = sizeof(JobStatusPacket);
 	else bytesToCopy = size;
 	ret = bytesToCopy;
